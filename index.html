@@ -228,11 +228,14 @@ async function fetchProgress(url, label) {
   const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
   return buf;
 }
-const ready = (async () => {
+const headsReady = (async () => {
   heads = await (await fetch('models/heads.json')).json();
   origHeads = heads;
   const mine = load('myHeads');
   if (mine && mine.binary && mine.three) { heads = mine; }
+})();
+const ready = (async () => {
+  await headsReady;
   showAcc();
   cnnS = await ort.InferenceSession.create(await fetchProgress('models/mrl_cnn.onnx', 'Loading open/closed model'), { executionProviders: ['wasm'] });
   $('loadStatus').textContent = 'Open/closed model ready. Loading fatigue model…';
@@ -529,7 +532,7 @@ async function loadTrainData() {
 $('retrainBtn').onclick = async () => {
   $('retrainBtn').disabled = true; $('retrainResult').textContent = 'Loading training data…';
   try {
-    await ready;
+    await headsReady;
     const base = await loadTrainData();
     const res = await new Promise((resolve, reject) => {
       const w = new Worker(new URL('trainer.js', location.href), { type: 'module' });
