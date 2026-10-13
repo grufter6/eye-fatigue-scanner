@@ -136,6 +136,40 @@
       Hold still, keep one eye in the box, and look at the screen. The model calls the eye closed below 30% open and open again above 70%.</p>
   </div>
 
+  <div class="card blink">
+    <h2>Teach the model</h2>
+    <p class="note" style="margin:0">Scan your eye, say how you actually feel, then see what the model guessed. Your answer is saved
+      in this browser only (no photo, just the model's numbers for it), and the model learns from it when you retrain. You answer first, so the guess can't influence you.</p>
+    <div class="controls">
+      <button id="labelBtn">Scan &amp; label</button>
+      <button id="retrainBtn" class="ghost">Retrain with my labels</button>
+      <button id="resetBtn" class="ghost">Reset to original model</button>
+      <span class="note" id="fbStats"></span>
+    </div>
+    <div class="teach-row" id="labelForm" hidden>
+      <img id="labelImg" alt="">
+      <div>
+        <div class="note">How do you actually feel right now?</div>
+        <div class="pick" id="labelPick">
+          <button data-v="alert">Alert</button><button data-v="strained">Strained</button><button data-v="fatigued">Fatigued</button>
+        </div>
+        <div class="note" style="margin-top:6px">Sleepiness over the last 10 minutes (Karolinska Sleepiness Scale)</div>
+        <select id="kss">
+          <option value="">choose 1–9</option>
+          <option value="1">1 · Extremely alert</option><option value="2">2 · Very alert</option><option value="3">3 · Alert</option>
+          <option value="4">4 · Rather alert</option><option value="5">5 · Neither alert nor sleepy</option>
+          <option value="6">6 · Some signs of sleepiness</option><option value="7">7 · Sleepy, no effort to stay awake</option>
+          <option value="8">8 · Sleepy, some effort to stay awake</option><option value="9">9 · Very sleepy, fighting sleep</option>
+        </select>
+        <div class="note" id="blinkInclude" style="margin-top:6px"></div>
+        <div class="controls"><button id="saveLabel" disabled>Save and show the guess</button><button id="cancelLabel" class="ghost">Cancel</button></div>
+      </div>
+    </div>
+    <p id="labelResult"></p>
+    <p class="note" id="retrainResult"></p>
+    <p class="note">Tips: label at different times (right after waking, late evening, after screen time) in similar light.
+      A score worth trusting needs at least 20–30 labels of each kind over several days.</p>
+  </div>
 </main>
 
 <script type="module">
@@ -180,7 +214,9 @@ function grabBox(maxSide) {
 }
 
 // ---- Models (ONNX, exported by web/export.py) --------------------------------
-let cnnS = null, dinoS = null, heads = null;
+let cnnS = null, dinoS = null, heads = null, origHeads = null;
+function load(k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } }
+function store(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } }
 async function fetchProgress(url, label) {
   const r = await fetch(url); const total = +r.headers.get('content-length') || 0;
   const reader = r.body.getReader(); const parts = []; let got = 0;
@@ -194,15 +230,23 @@ async function fetchProgress(url, label) {
 }
 const ready = (async () => {
   heads = await (await fetch('models/heads.json')).json();
-  $('accB').textContent = (heads.binary.acc * 100).toFixed(1) + '%';
-  $('acc3').textContent = (heads.three.acc * 100).toFixed(1) + '%';
+  origHeads = heads;
+  const mine = load('myHeads');
+  if (mine && mine.binary && mine.three) { heads = mine; }
+  showAcc();
   cnnS = await ort.InferenceSession.create(await fetchProgress('models/mrl_cnn.onnx', 'Loading open/closed model'), { executionProviders: ['wasm'] });
   $('loadStatus').textContent = 'Open/closed model ready. Loading fatigue model…';
   const dbuf = await fetchProgress('models/dinov2_s14.onnx', 'Loading fatigue model (DINOv2)');
   try { dinoS = await ort.InferenceSession.create(dbuf, { executionProviders: ['webgpu'] }); }
   catch (e) { dinoS = await ort.InferenceSession.create(dbuf, { executionProviders: ['wasm'] }); }
-  $('loadStatus').textContent = 'Models loaded. Everything runs on this device.';
+  $('loadStatus').textContent = 'Models loaded. Everything runs on this device.' + (heads !== origHeads ? ' Using your retrained model.' : '');
+  showAcc();
 })().catch(e => { $('loadStatus').textContent = 'Could not load the models: ' + e.message; $('loadStatus').className = 'err'; });
+
+function showAcc() {
+  $('accB').textContent = (heads.binary.acc * 100).toFixed(1) + '%';
+  $('acc3').textContent = (heads.three.acc * 100).toFixed(1) + '%';
+}
 
 // Centre square of a canvas, resized to n x n.
 function square(src, n) {
@@ -410,6 +454,106 @@ $('baseBtn').onclick = () => { if (lastTest) { saveBaseline(lastTest); $('testRe
 (function tick() { if (blinkOn) { drawTrace(); showStats(); } requestAnimationFrame(tick); })();
 drawTrace();
 
+// ---- Teach the model ---------------------------------------------------------
+// Each scan is stored as its DINOv2 embedding (no image) in localStorage. Retraining refits both
+// heads in a Web Worker on the original training embeddings plus these scans (trainer.js).
+let pendingImg = null, pendingLabel = null;
+const pct = x => Math.round(x * 100) + '%';
+const scans = () => load('myScans') || [];
+function feedbackStats() {
+  const rows = scans(), n = rows.length, by = { alert: 0, strained: 0, fatigued: 0 };
+  rows.forEach(r => by[r.label]++);
+  const bin = rows.filter(r => r.label !== 'strained');
+  return { n, by_label: by, right3: rows.filter(r => r.pred === r.label).length,
+           n_bin: bin.length, right_bin: bin.filter(r => (r.p_fatigued > 0.5) === (r.label === 'fatigued')).length };
+}
+function showFb(st) {
+  if (!st || !st.n) { $('fbStats').textContent = 'No labels yet'; return; }
+  const b = st.by_label;
+  $('fbStats').textContent = `${st.n} labels (alert ${b.alert}, strained ${b.strained}, fatigued ${b.fatigued}) · ` +
+    `model right on ${st.right3} of ${st.n} live guesses` + (st.n_bin ? `, ${st.right_bin} of ${st.n_bin} alert-vs-fatigued` : '');
+}
+showFb(feedbackStats());
+
+$('labelBtn').onclick = () => {
+  const img = grabBox();
+  if (!img) { $('labelResult').textContent = 'Camera not ready.'; return; }
+  pendingImg = img; pendingLabel = null;
+  $('labelImg').src = img.toDataURL('image/jpeg', 0.8); $('labelForm').hidden = false; $('labelResult').textContent = '';
+  document.querySelectorAll('#labelPick button').forEach(b => b.classList.remove('sel'));
+  $('kss').value = ''; $('saveLabel').disabled = true;
+  const fresh = lastTest && (Date.now() - Date.parse(lastTest.at) < 5 * 60000);
+  $('blinkInclude').textContent = fresh ? 'Your 60-second blink test from the last 5 minutes will be saved with this label.' :
+    'Tip: run the 60-second blink test first and its results get saved with this label.';
+};
+document.querySelectorAll('#labelPick button').forEach(b => b.onclick = () => {
+  pendingLabel = b.dataset.v;
+  document.querySelectorAll('#labelPick button').forEach(x => x.classList.toggle('sel', x === b));
+  $('saveLabel').disabled = false;
+});
+$('cancelLabel').onclick = () => { $('labelForm').hidden = true; pendingImg = null; };
+$('saveLabel').onclick = async () => {
+  $('saveLabel').disabled = true;
+  const fresh = lastTest && (Date.now() - Date.parse(lastTest.at) < 5 * 60000);
+  try {
+    await ready;
+    if (!dinoS) throw new Error('models are still loading');
+    while (busy) await new Promise(r => setTimeout(r, 100));
+    busy = true;
+    $('labelResult').textContent = 'Scanning…';
+    const o = await pOpen(pendingImg), e = await embed(pendingImg);
+    busy = false;
+    // The guess is made BEFORE this scan is learned from, so the hit rate is an honest test on new data.
+    const pb = head(heads.binary, e), p3 = head(heads.three, e);
+    const pred = Object.keys(p3).reduce((a, k) => p3[k] > p3[a] ? k : a);
+    const rows = scans();
+    rows.push({ e: Array.from(e, v => +v.toFixed(5)), label: pendingLabel, kss: $('kss').value, day: new Date().toISOString().slice(0, 10),
+                at: new Date().toISOString(), pred, p_fatigued: pb.fatigued, p_open: o.p, blink: fresh ? lastTest : null });
+    if (!store('myScans', rows)) throw new Error('browser storage is full or blocked');
+    $('labelForm').hidden = true;
+    $('labelResult').innerHTML = `You said <b>${pendingLabel}</b>. The model guessed <b>${pred}</b> ` +
+      `(alert ${pct(p3.alert)}, strained ${pct(p3.strained)}, fatigued ${pct(p3.fatigued)}) — ` +
+      (pred === pendingLabel ? '<span class="ok">right</span>' : '<span class="no">wrong</span>') + '. Saved in this browser.';
+    showFb(feedbackStats());
+  } catch (e) { busy = false; $('labelResult').textContent = 'Not saved: ' + e.message; }
+};
+
+let trainData = null;
+async function loadTrainData() {
+  if (trainData) return trainData;
+  const meta = await (await fetch('models/train.json')).json();
+  const f = new Float32Array(await (await fetch('models/train.bin')).arrayBuffer()), d = meta.dim;
+  const rows = Array.from({ length: f.length / d }, (_, i) => f.subarray(i * d, i * d + d)), nr = meta.real.labels.length;
+  return trainData = { real: { X: rows.slice(0, nr), y: meta.real.labels, days: meta.real.days }, web: { X: rows.slice(nr), y: meta.web.labels } };
+}
+$('retrainBtn').onclick = async () => {
+  $('retrainBtn').disabled = true; $('retrainResult').textContent = 'Loading training data…';
+  try {
+    await ready;
+    const base = await loadTrainData();
+    const res = await new Promise((resolve, reject) => {
+      const w = new Worker(new URL('trainer.js', location.href), { type: 'module' });
+      w.onmessage = m => {
+        if (m.data.step) $('retrainResult').textContent = `Retraining ${m.data.step}… (about 15 seconds)`;
+        else { w.terminate(); m.data.error ? reject(new Error(m.data.error)) : resolve(m.data.done); }
+      };
+      w.onerror = e => { w.terminate(); reject(new Error(e.message || 'worker failed')); };
+      w.postMessage({ ...base, scans: scans().map(s => ({ e: s.e, label: s.label, day: s.day })),
+                      C: { binary: origHeads.binary.C, three: origHeads.three.C } });
+    });
+    heads = { binary: res.binary, three: res.three };
+    store('myHeads', heads); showAcc();
+    $('retrainResult').textContent = `Retrained on ${res.n} photos (${res.n_scans} of them your labelled scans). ` +
+      `Tested on days it never saw: alert vs fatigued ${pct(res.binary.acc)} (guessing ${pct(res.binary.baseline)}), ` +
+      `3-way ${pct(res.three.acc)} (guessing ${pct(res.three.baseline)}). The scanner now uses your model, saved in this browser.`;
+  } catch (e) { $('retrainResult').textContent = 'Retrain failed: ' + e.message; }
+  $('retrainBtn').disabled = false;
+};
+$('resetBtn').onclick = () => {
+  try { localStorage.removeItem('myHeads'); } catch (e) {}
+  if (origHeads) { heads = origHeads; showAcc(); }
+  $('retrainResult').textContent = 'Back to the original model. Your labelled scans are kept; retrain to use them again.';
+};
 </script>
 </body>
 </html>
